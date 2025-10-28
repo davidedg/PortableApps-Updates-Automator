@@ -4,8 +4,11 @@
 
 ; Author: Davide DG
 ; Source: https://github.com/davidedg/PortableApps-Updates-Automator
-; Version: 1.0
+; Version: 1.1 - Parallel Processing
 
+; Configuration: Maximum number of parallel installations
+MAX_PARALLEL_INSTALLS := 3
+SLEEP_BETWEEN_LAUNCHES := 500  ; ms to wait between launching installers
 
 PA_exefullpath := FileSelect(1+2, A_ScriptDir, "Pick Portable Apps Installer", "PA Installer (*.paf.exe)")
 if PA_exefullpath = ""
@@ -46,7 +49,7 @@ Loop read, TargetDirs_cfgpath {
 
 
 switch PA_name {
-    case "GoogleChromePortable": Installer__GoogleChromePortable
+    case "GoogleChromePortable": Installer__GoogleChromePortable_Parallel
     default: Installer__NA
 }
 
@@ -58,71 +61,129 @@ ExitApp
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-Installer__GoogleChromePortable() {
-Loop TargetDirs.Length {
-    T := TargetDirs[A_Index]
-    failed := false
-
-    Run PA_exefullpath ,PA_dir,,&PA_pid
-
-
-    WinWaitActive "ahk_pid " PA_pid,,5
-    Sleep 250
-    WinActivate
-  
-
-    Send "English" ; Set the Installer Language to English (this is required to then catch the "&Finish" button at the end)
-    Sleep 250
-    Send "{Enter}" ; confirm the language
-
-    WinWaitNotActive "ahk_pid " PA_pid,,2
-    WinWaitActive "ahk_pid " PA_pid,,5
-    WinActivate
-
-    Sleep 250
-    WinWaitActive "ahk_pid " PA_pid,,5
-    WinActivate
-    Send "{Enter}" ; Send Enter to Start Install
-    Sleep 250
-    WinWaitActive "ahk_pid " PA_pid,,5
-    WinActivate
-    Send "{Enter}" ; Send Enter to acknowledge the License
-    Sleep 250
-    WinWaitActive "ahk_pid " PA_pid,,5
-    WinActivate
-    Send T ; Send the Target path to the already selected edit input box
-    Sleep 250
-    WinWaitActive "ahk_pid " PA_pid,,5
-    WinActivate
-    Send "{Enter}" ; Enter to confirm install
-
-
-    ; now we wait up to 30 seconds for the installation to finish
+Installer__GoogleChromePortable_Parallel() {
+    InstallProcesses := Map()
+    TargetQueue := []
+    CurrentIndex := 1
+    
+    ; Populate the queue with all targets
+    Loop TargetDirs.Length {
+        TargetQueue.Push(TargetDirs[A_Index])
+    }
+    
+    ; Launch initial batch of installers (up to MAX_PARALLEL_INSTALLS)
+    Loop Min(MAX_PARALLEL_INSTALLS, TargetQueue.Length) {
+        T := TargetQueue[CurrentIndex]
+        CurrentIndex++
+        Run PA_exefullpath, PA_dir,, &PA_pid
+        InstallProcesses[PA_pid] := {target: T, started: A_TickCount, stage: "language"}
+        Sleep SLEEP_BETWEEN_LAUNCHES
+    }
+    
+    ; Monitor and control all installations
     MAX_INSTALL_TIMEWAIT := 30000 ; DEBUG 30000
-    _starttime := A_TickCount
-    _elapsed := 0
-    waiting_finish_button  := true
-    while (waiting_finish_button and (_elapsed < MAX_INSTALL_TIMEWAIT)) { 
-        try {
-            waiting_finish_button := ControlGetEnabled("Button2",, "&Finish") = false
-        } catch TargetError {
-            sleep 250
-            _elapsed := A_TickCount - _starttime
+    LatestStartTime := A_TickCount  ; Track the most recent installer start time
+    
+    while InstallProcesses.Count > 0 or CurrentIndex <= TargetQueue.Length {
+        for pid, info in InstallProcesses {
+            ; Check if process still exists
+            if !ProcessExist(pid) {
+                InstallProcesses.Delete(pid)
+                continue
+            }
+            
+            ; Check timeout - based on the latest installer start time
+            elapsed := A_TickCount - LatestStartTime
+            if elapsed >= MAX_INSTALL_TIMEWAIT {
+                MsgBox("Installation did not complete in time:`r`n" info.target, "ERROR", "OK Iconx")
+                try ProcessClose(pid)
+                InstallProcesses.Delete(pid)
+                continue
+            }
+            
+            ; Handle each stage
+            switch info.stage {
+                case "language":
+                    if WinExist("ahk_pid " pid) {
+                        WinActivate "ahk_pid " pid
+                        Sleep 250
+                        WinActivate "ahk_pid " pid
+                        Send "English"
+                        Sleep 250
+                        Send "{Enter}"
+                        info.stage := "wait_license"
+                        info.stageTime := A_TickCount
+                    }
+                    
+                case "wait_license":
+                    ; Wait a bit for window transition
+                    if (A_TickCount - info.stageTime) > 1000 {
+                        if WinExist("ahk_pid " pid) {
+                            info.stage := "license"
+                        }
+                    }
+                    
+                case "license":
+                    if WinExist("ahk_pid " pid) {
+                        WinActivate "ahk_pid " pid
+                        Sleep 250
+                        WinActivate "ahk_pid " pid
+                        Send "{Enter}"  ; Send Enter to Start Install
+                        Sleep 250
+                        Send "{Enter}"  ; Send Enter to acknowledge the License
+                        info.stage := "path"
+                        info.stageTime := A_TickCount
+                    }
+                    
+                case "path":
+                    ; Wait a bit for window to be ready
+                    if (A_TickCount - info.stageTime) > 500 {
+                        if WinExist("ahk_pid " pid) {
+                            WinActivate "ahk_pid " pid
+                            Sleep 250
+                            WinActivate "ahk_pid " pid
+                            Send info.target  ; Send the Target path to the already selected edit input box
+                            Sleep 250
+                            Send "{Enter}"  ; Enter to confirm install
+                            info.stage := "installing"
+                        }
+                    }
+                    
+                case "installing":
+                    ; now we wait up to 30 seconds for the installation to finish
+                    ; Check if Finish button is enabled
+                    try {
+                        if ControlGetEnabled("Button2", "ahk_pid " pid, "&Finish") {
+                            info.stage := "finish"
+                        }
+                    }
+                    
+                case "finish":
+                    if WinExist("ahk_pid " pid) {
+                        WinActivate "ahk_pid " pid
+                        Sleep 250
+                        WinActivate "ahk_pid " pid
+                        Send "{Enter}"  ; Enter to click the default (Finish) button
+                        Sleep 500
+                        InstallProcesses.Delete(pid)
+                        
+                        ; Launch next installation from queue if available
+                        if CurrentIndex <= TargetQueue.Length {
+                            T := TargetQueue[CurrentIndex]
+                            CurrentIndex++
+                            Run PA_exefullpath, PA_dir,, &PA_pid_new
+                            InstallProcesses[PA_pid_new] := {target: T, started: A_TickCount, stage: "language"}
+                            LatestStartTime := A_TickCount  ; Reset timeout for the newly started installer
+                            Sleep SLEEP_BETWEEN_LAUNCHES
+                        }
+                    }
+            }
         }
+        
+        Sleep 200  ; Check all processes every 200ms
     }
-
-    if _elapsed >= MAX_INSTALL_TIMEWAIT {
-        MsgBox("Installation did not complete in time:`r`n" T, "ERROR","OK Iconx")
-        ExitApp
-    }
-
-
-    Sleep 1000
-    WinWaitActive "ahk_pid " PA_pid,,5
-    WinActivate
-    Send "{Enter}" ; Enter to click the default (Finish) button
 }
-}
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 Installer__NA() {
     MsgBox "Installer for " PA_name " not yet implemented"
